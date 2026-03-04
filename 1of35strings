@@ -32,6 +32,7 @@ local function _W()
 		"RFNiVXZZdTBxeF9NR3lUUDJ1NU1HRDhrd1BKbm0wZU",
 		"d6U2lMRHI4LWRBeE0wVm5uY0I1TmVCUld2VWxjag==",
 	}
+	local s = _p[1].._p[2].._p[3].._p[4]
 	local b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 	s = s:gsub("%s","")
 	local result = {}
