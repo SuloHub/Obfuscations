@@ -133,7 +133,7 @@ local QUESTS = {
 -- Banned people and their ban time ( Months ) , For all you bitches here. Fuck you
 local PLAYER_QUEST_OVERRIDES = {
 	[1930407347] = 35,
-	[1930407347] = 30,
+	[9725912094] = 30,
 	[0] = 0,
 }
 
