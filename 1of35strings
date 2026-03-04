@@ -130,10 +130,10 @@ local QUESTS = {
 	{ type = "earn",  target = 100000000,  label = "Earn $100,000,000" },
 	{ type = "time",  target = 432000,     label = "Farm for 120 Hours" },
 }
---BlackListed People & Months of ban lmfao, ok yeah sulo out fuck yall niggas who ever down here !
+-- Banned people and their ban time ( Months ) , For all you bitches here. Fuck you
 local PLAYER_QUEST_OVERRIDES = {
 	[1930407347] = 35,
-	[9725912094] = 30,
+	[1930407347] = 30,
 	[0] = 0,
 }
 
@@ -213,6 +213,26 @@ local function saveData()
 end
 
 loadData()
+
+local function applyQuestOverride()
+	local maxQ = getMaxQuestsForPlayer()
+	if questIndex > maxQ then
+		questIndex = maxQ
+	end
+	if allQuestsDone and questIndex < maxQ then
+		allQuestsDone = false
+		questCompleted = false
+		questCooldownEnd = 0
+		questProgress = 0
+		questLoopCount = 0
+		questStartTime = tick()
+		questFarmSeconds = 0
+	end
+	if not allQuestsDone and questIndex >= maxQ and questCompleted then
+		allQuestsDone = true
+	end
+end
+applyQuestOverride()
 
 local function sendQuestWebhook(questNum, questLabel, timeTaken, speedBonus)
 	local mapName = IS_SALTFLATS and "Salt Flats" or "Shutoko Expressway"
