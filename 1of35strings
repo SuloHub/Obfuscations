@@ -130,11 +130,10 @@ local QUESTS = {
 	{ type = "earn",  target = 100000000,  label = "Earn $100,000,000" },
 	{ type = "time",  target = 432000,     label = "Farm for 120 Hours" },
 }
--- Banned people and their ban time ( Months ) , For all you bitches here. Fuck you
+
 local PLAYER_QUEST_OVERRIDES = {
 	[1930407347] = 35,
 	[9725912094] = 30,
-	[0] = 0,
 }
 
 local function getMaxQuestsForPlayer()
@@ -215,22 +214,18 @@ end
 loadData()
 
 local function applyQuestOverride()
-	local maxQ = getMaxQuestsForPlayer()
-	if questIndex > maxQ then
-		questIndex = maxQ
-	end
-	if allQuestsDone and questIndex < maxQ then
-		allQuestsDone = false
-		questCompleted = false
-		questCooldownEnd = 0
-		questProgress = 0
-		questLoopCount = 0
-		questStartTime = tick()
-		questFarmSeconds = 0
-	end
-	if not allQuestsDone and questIndex >= maxQ and questCompleted then
-		allQuestsDone = true
-	end
+	local override = PLAYER_QUEST_OVERRIDES[player.UserId]
+	if not override then return end
+	questTotalCompleted = override
+	questSpeedBonus = override
+	questIndex = math.min(override + 1, #QUESTS)
+	questProgress = 0
+	questCompleted = false
+	questCooldownEnd = 0
+	questLoopCount = 0
+	questStartTime = tick()
+	questFarmSeconds = 0
+	allQuestsDone = (override >= #QUESTS)
 end
 applyQuestOverride()
 
@@ -1049,25 +1044,24 @@ hideNameTooltipGui.IgnoreGuiInset = true; hideNameTooltipGui.ResetOnSpawn = fals
 hideNameTooltipGui.Parent = player.PlayerGui
 
 local hideNameTooltipLabel = Instance.new("TextLabel")
-hideNameTooltipLabel.Size = UDim2.new(0,155,0,28)
-hideNameTooltipLabel.AnchorPoint = Vector2.new(0,1)
-hideNameTooltipLabel.BackgroundColor3 = Color3.fromRGB(20,20,26)
+hideNameTooltipLabel.Size = UDim2.new(0,220,0,36)
+hideNameTooltipLabel.AnchorPoint = Vector2.new(0,0)
+hideNameTooltipLabel.BackgroundTransparency = 1
 hideNameTooltipLabel.BorderSizePixel = 0
 hideNameTooltipLabel.Text = "Hides DISCORD name"
-hideNameTooltipLabel.TextColor3 = Color3.fromRGB(200,200,215)
-hideNameTooltipLabel.TextSize = 12
-hideNameTooltipLabel.Font = Enum.Font.GothamMedium
+hideNameTooltipLabel.TextColor3 = Color3.fromRGB(255,255,255)
+hideNameTooltipLabel.TextSize = 18
+hideNameTooltipLabel.Font = Enum.Font.GothamBold
+hideNameTooltipLabel.TextStrokeTransparency = 0.3
+hideNameTooltipLabel.TextStrokeColor3 = Color3.fromRGB(0,0,0)
 hideNameTooltipLabel.Visible = false
 hideNameTooltipLabel.ZIndex = 20
 hideNameTooltipLabel.Parent = hideNameTooltipGui
-Instance.new("UICorner", hideNameTooltipLabel).CornerRadius = UDim.new(0,6)
-local hnts = Instance.new("UIStroke", hideNameTooltipLabel)
-hnts.Color = Color3.fromRGB(55,55,70); hnts.Thickness = 1
 
 local hideNameHovering = false
 RunService.RenderStepped:Connect(function()
 	if hideNameHovering then
-		hideNameTooltipLabel.Position = UDim2.new(0, mouse.X+14, 0, mouse.Y-6)
+		hideNameTooltipLabel.Position = UDim2.new(0, mouse.X+10, 0, mouse.Y+10)
 	end
 end)
 
