@@ -1,1 +1,1676 @@
-fixing soon..
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local ContentProvider = game:GetService("ContentProvider")
+
+local TrafficFolder = Workspace:WaitForChild("TrafficFolder")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local HttpService = game:GetService("HttpService")
+
+-- ==================== PERSISTENT STATS ====================
+local PASTEBIN_URL = "https://gist.githubusercontent.com/SuloBro/31685a0970f19bdee36b685daca12472/raw/8844dbf881388fcf4fabbaeb6302b82a7aa7ed4b/feedback.json"
+local STATS_FILE = "CCT_Stats_" .. tostring(player.UserId) .. ".json"
+local StatsData = {
+	execCount = 0,
+	totalMoneyGained = 0,
+	longestAfkSeconds = 0,
+	lastUsername = player.Name,
+}
+local sessionStart = os.clock()
+local sessionMoneyBase = nil
+local afkSessionStart = nil
+local currentAfkSeconds = 0
+
+local function formatDots(n)
+	n = math.floor(tonumber(n) or 0)
+	local s = tostring(n)
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+	return out
+end
+
+local function formatHMS(sec)
+	sec = math.max(0, math.floor(sec))
+	local h = math.floor(sec / 3600)
+	local m = math.floor((sec % 3600) / 60)
+	local s = sec % 60
+	return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+local function statsLoad()
+	-- local file first
+	pcall(function()
+		if readfile and isfile and isfile(STATS_FILE) then
+			local decoded = HttpService:JSONDecode(readfile(STATS_FILE))
+			if type(decoded) == "table" then
+				for k, v in pairs(decoded) do
+					if StatsData[k] ~= nil then StatsData[k] = v end
+				end
+			end
+		end
+	end)
+	-- optional remote gist seed (read-only)
+	pcall(function()
+		local body = nil
+		if request then
+			local res = request({Url = PASTEBIN_URL, Method = "GET"})
+			body = res and (res.Body or res.body)
+		elseif syn and syn.request then
+			local res = syn.request({Url = PASTEBIN_URL, Method = "GET"})
+			body = res and res.Body
+		end
+		if body and #body > 2 then
+			local decoded = HttpService:JSONDecode(body)
+			if type(decoded) == "table" and type(decoded[tostring(player.UserId)]) == "table" then
+				local remote = decoded[tostring(player.UserId)]
+				if (remote.execCount or 0) > (StatsData.execCount or 0) then
+					StatsData.execCount = remote.execCount
+				end
+				if (remote.totalMoneyGained or 0) > (StatsData.totalMoneyGained or 0) then
+					StatsData.totalMoneyGained = remote.totalMoneyGained
+				end
+				if (remote.longestAfkSeconds or 0) > (StatsData.longestAfkSeconds or 0) then
+					StatsData.longestAfkSeconds = remote.longestAfkSeconds
+				end
+			end
+		end
+	end)
+	StatsData.execCount = (StatsData.execCount or 0) + 1
+	StatsData.lastUsername = player.Name
+end
+
+local function statsSave()
+	pcall(function()
+		if writefile then
+			writefile(STATS_FILE, HttpService:JSONEncode(StatsData))
+		end
+	end)
+end
+
+statsLoad()
+statsSave()
+
+-- track cash gains
+task.spawn(function()
+	while true do
+		local ls = player:FindFirstChild("leaderstats")
+		local cash = ls and (ls:FindFirstChild("Cash") or ls:FindFirstChild("Money") or ls:FindFirstChild("cash"))
+		if cash and (cash:IsA("NumberValue") or cash:IsA("IntValue")) then
+			if sessionMoneyBase == nil then
+				sessionMoneyBase = cash.Value
+			else
+				local gained = cash.Value - sessionMoneyBase
+				if gained > 0 then
+					StatsData.totalMoneyGained = (StatsData.totalMoneyGained or 0) + gained
+					sessionMoneyBase = cash.Value
+					statsSave()
+				elseif cash.Value < sessionMoneyBase then
+					sessionMoneyBase = cash.Value
+				end
+			end
+		end
+		-- AFK longest
+		if afkActive then
+			if not afkSessionStart then afkSessionStart = os.clock() end
+			currentAfkSeconds = os.clock() - afkSessionStart
+			if currentAfkSeconds > (StatsData.longestAfkSeconds or 0) then
+				StatsData.longestAfkSeconds = currentAfkSeconds
+			end
+		else
+			if afkSessionStart then
+				local dur = os.clock() - afkSessionStart
+				if dur > (StatsData.longestAfkSeconds or 0) then
+					StatsData.longestAfkSeconds = dur
+					statsSave()
+				end
+				afkSessionStart = nil
+			end
+		end
+		task.wait(1)
+	end
+end)
+
+
+local IDS = {
+	LOADING = "rbxassetid://102470379716260",
+	CLICK = "rbxassetid://130902023493606",
+	HOVER = "rbxassetid://117465761207367",
+	AFK = "rbxassetid://12641434961",
+	DRIVE = "rbxassetid://4720536478",
+	COLLISION = "rbxassetid://6034687804",
+	ACCEL = "rbxassetid://93530831308666",
+	BRAKE = "rbxassetid://12888808396",
+	RACE = "rbxassetid://99044142206169",
+	ALARM = "rbxassetid://9081144733",
+}
+local LOADING_VIDEO_ID, CLICK_SOUND_ID, HOVER_SOUND_ID = IDS.LOADING, IDS.CLICK, IDS.HOVER
+local AFK_ICON_ID, DRIVE_ICON_ID, COLLISION_ICON_ID = IDS.AFK, IDS.DRIVE, IDS.COLLISION
+local ACCEL_ICON_ID, BRAKE_ICON_ID, RACE_ICON_ID = IDS.ACCEL, IDS.BRAKE, IDS.RACE
+
+local TROLL_GROUP_ID, TROLL_MIN_RANK = 10612101, 6
+local collisionActive, driveActive, afkActive, raceActive = false, false, false, false
+local trollLevelActive, trollMoneyActive = false, false
+local AFK_DISABLED = (game.PlaceId == 89114627752014)
+local RACE_ENABLED = (game.PlaceId == 137228775845999)
+
+local LIFT, DRIVE_FRONT_DIST, DRIVE_BACK_DIST, DRIVE_SPEED, DRIVE_SIDE_OFFSET =
+	20, 40, -15, 15, 13
+
+local AFK_POINTS = {
+	Vector3.new(-3499, 65, -1787),
+	Vector3.new(-3508, 64, -3137),
+	Vector3.new(-3521, 64, -3867),
+	Vector3.new(-3600, 64, -5016),
+	Vector3.new(-3628, 64, -5179),
+	Vector3.new(-3740, 64, -6051),
+	Vector3.new(-3795, 64, -6284),
+	Vector3.new(-3954, 64, -7111),
+	Vector3.new(-4229, 64, -8049),
+	Vector3.new(-4368, 64, -8427),
+	Vector3.new(-4685, 64, -9255),
+	Vector3.new(-5008, 64, -10005),
+	Vector3.new(-5384, 64, -10702),
+	Vector3.new(-5730, 64, -11301),
+	Vector3.new(-6042, 64, -11821),
+	Vector3.new(-6418, 64, -12328),
+	Vector3.new(-7061, 64, -13145),
+	Vector3.new(-7435, 64, -13584),
+	Vector3.new(-7861, 64, -14023),
+	Vector3.new(-8106, 64, -14266),
+	Vector3.new(-8815, 64, -14903),
+}
+local AFK_SPEED, AFK_ARRIVE_DIST = 450, 45
+local accelEnabled, brakeEnabled = false, false
+local velocityMult, brakeMult = 0.025, 0.15
+local raceTeleportSpeed, RACE_CHECK_DISTANCE = 0.25, 180
+local FINISH_TELEPORT = Vector3.new(-3595, 160, -192)
+
+-- Fake cars data
+local FAKE_CARS = {
+	{name = "Castellani Specchiera", image = "rbxthumb://type=Asset&id=95013642140260&w=420&h=420"},
+	{name = "Granadino Relámpago Fox Spec", image = "rbxassetid://109962408666273"},
+	{name = "Granadino Tocinero GT2", image = "rbxthumb://type=Asset&id=106928582026016&w=420&h=420"},
+	{name = "Vector W8 Twin Turbo", image = "rbxassetid://79369014545366"},
+	{name = "Stratton 585 TS", image = "rbxthumb://type=Asset&id=138749536160735&w=420&h=420"},
+	{name = "Takama F10 GT", image = "rbxthumb://type=Asset&id=85680812789719&w=420&h=420"},
+	{name = "Valhalla GT", image = "rbxassetid://98675689033362"},
+}
+
+ContentProvider:PreloadAsync({LOADING_VIDEO_ID, CLICK_SOUND_ID, HOVER_SOUND_ID, AFK_ICON_ID, DRIVE_ICON_ID, COLLISION_ICON_ID, ACCEL_ICON_ID, BRAKE_ICON_ID, RACE_ICON_ID})
+
+local clickSound = Instance.new("Sound")
+clickSound.SoundId = CLICK_SOUND_ID
+clickSound.Volume = 0.5
+clickSound.Parent = playerGui
+
+local hoverSound = Instance.new("Sound")
+hoverSound.SoundId = HOVER_SOUND_ID
+hoverSound.Volume = 0.3
+hoverSound.Parent = playerGui
+
+-- Reliable clipboard helper (works in most executors; falls back gracefully)
+local function copyToClipboard(text)
+	text = tostring(text or "")
+	-- Preferred: executor setclipboard
+	if typeof(setclipboard) == "function" then
+		local ok = pcall(setclipboard, text)
+		if ok then return true end
+	end
+	-- Some environments expose Clipboard global
+	if Clipboard and typeof(Clipboard.SetText) == "function" then
+		local ok = pcall(function() Clipboard:SetText(text) end)
+		if ok then return true end
+	end
+	-- Last resort: try any service that might exist
+	local ok = pcall(function()
+		local svc = game:GetService("ClipboardService")
+		if svc and svc.SetText then svc:SetText(text) end
+	end)
+	if ok then return true end
+	warn("[CCT] Clipboard not available in this environment. Text was: " .. text)
+	return false
+end
+
+local comboUI = playerGui:FindFirstChild("ComboUI")
+local comboContainer = comboUI and comboUI:FindFirstChild("ComboContainer")
+local topRow = comboContainer and comboContainer:FindFirstChild("TopRow")
+local comboText = topRow and topRow:FindFirstChild("ComboText")
+local ptsText = comboContainer and comboContainer:FindFirstChild("PtsText")
+
+if comboContainer then comboContainer.Visible = false end
+if comboText then
+	comboText.Text = "COMBO IS SECURED"
+	comboText:GetPropertyChangedSignal("Text"):Connect(function()
+		if comboText.Text ~= "COMBO IS SECURED" then comboText.Text = "COMBO IS SECURED" end
+	end)
+end
+if ptsText then
+	ptsText.Text = "+0"
+	ptsText:GetPropertyChangedSignal("Text"):Connect(function()
+		if ptsText.Text ~= "+0" then ptsText.Text = "+0" end
+	end)
+end
+
+-- ==================== RACE FRAME DETECTION ====================
+local raceFrameVisible = false
+local raceInfoText = nil
+
+local function checkRaceFrame()
+	if not RACE_ENABLED then return end
+	local raceMode = playerGui:FindFirstChild("RaceMode")
+	if not raceMode then return end
+	local mainFrame = raceMode:FindFirstChildOfClass("Frame")
+	if not mainFrame then return end
+	local left = mainFrame:FindFirstChild("Left")
+	if left then
+		if left.Visible and not raceFrameVisible then
+			raceFrameVisible = true
+			task.wait(6.5)
+			if raceInfoText then
+				raceInfoText.Text = "Avoid getting on leaderboard!"
+				task.wait(6.5)
+				raceInfoText.Text = "Avoid getting on leaderboard!"
+			end
+		elseif not left.Visible then
+			raceFrameVisible = false
+		end
+	end
+end
+
+RunService.Heartbeat:Connect(function()
+	checkRaceFrame()
+end)
+
+-- ==================== GROUP RANK CHECK ====================
+local function getPlayerGroupRank()
+	local success, rank = pcall(function()
+		return player:GetRankInGroup(TROLL_GROUP_ID)
+	end)
+	if success then
+		return rank
+	end
+	return 0
+end
+
+local function hasTrollAccess()
+	local rank = getPlayerGroupRank()
+	return rank >= TROLL_MIN_RANK
+end
+
+-- ==================== GUI ====================
+local gui = Instance.new("ScreenGui")
+gui.Name = "CCT_UI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.Parent = playerGui
+
+local overlay = Instance.new("Frame")
+overlay.Size = UDim2.new(1, 0, 1, 0)
+overlay.BackgroundColor3 = Color3.fromRGB(3, 3, 5)
+overlay.BorderSizePixel = 0
+overlay.ZIndex = 100
+overlay.Parent = gui
+
+local gridPattern = Instance.new("Frame")
+gridPattern.Size = UDim2.new(1, 0, 1, 0)
+gridPattern.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+gridPattern.BackgroundTransparency = 0.85
+gridPattern.BorderSizePixel = 0
+gridPattern.ZIndex = 101
+gridPattern.Parent = overlay
+
+local videoFrame = Instance.new("VideoFrame")
+videoFrame.Size = UDim2.new(1, 0, 1, 0)
+videoFrame.Video = LOADING_VIDEO_ID
+videoFrame.Looped = true
+videoFrame.Volume = 0
+videoFrame.BackgroundTransparency = 1
+videoFrame.ZIndex = 102
+videoFrame.Parent = overlay
+videoFrame:Play()
+
+local introContainer = Instance.new("Frame")
+introContainer.Size = UDim2.new(0, 420, 0, 120)
+introContainer.Position = UDim2.new(0.5, -210, 0.5, -60)
+introContainer.BackgroundTransparency = 1
+introContainer.ZIndex = 103
+introContainer.Parent = overlay
+
+local introTitle = Instance.new("TextLabel")
+introTitle.Size = UDim2.new(1, 0, 0, 50)
+introTitle.Position = UDim2.new(0, 0, 0.2, 0)
+introTitle.BackgroundTransparency = 1
+introTitle.Text = "CCT"
+introTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+introTitle.TextSize = 34
+introTitle.Font = Enum.Font.GothamBlack
+introTitle.TextTransparency = 1
+introTitle.ZIndex = 104
+introTitle.Parent = introContainer
+
+local introSub = Instance.new("TextLabel")
+introSub.Size = UDim2.new(1, 0, 0, 20)
+introSub.Position = UDim2.new(0, 0, 0.65, 0)
+introSub.BackgroundTransparency = 1
+introSub.Text = "SYSTEM ONLINE"
+introSub.TextColor3 = Color3.fromRGB(0, 220, 255)
+introSub.TextSize = 12
+introSub.Font = Enum.Font.Code
+introSub.TextTransparency = 1
+introSub.ZIndex = 104
+introSub.Parent = introContainer
+
+local introBarBG = Instance.new("Frame")
+introBarBG.Size = UDim2.new(0, 260, 0, 4)
+introBarBG.Position = UDim2.new(0.5, -130, 0.88, 0)
+introBarBG.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+introBarBG.BorderSizePixel = 0
+introBarBG.ZIndex = 104
+introBarBG.Parent = introContainer
+
+local introBarFill = Instance.new("Frame")
+introBarFill.Size = UDim2.new(0, 0, 1, 0)
+introBarFill.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+introBarFill.BorderSizePixel = 0
+introBarFill.ZIndex = 105
+introBarFill.Parent = introBarBG
+
+local mainContainer = Instance.new("Frame")
+mainContainer.Name = "MainContainer"
+mainContainer.Size = UDim2.new(0, 320, 0, 460)
+mainContainer.Position = UDim2.new(0.5, -160, 0.5, -230)
+mainContainer.BackgroundTransparency = 1
+mainContainer.ZIndex = 20
+mainContainer.Parent = gui
+
+local bgShadow = Instance.new("Frame")
+bgShadow.Size = UDim2.new(1, 10, 1, 10)
+bgShadow.Position = UDim2.new(0, -5, 0, -5)
+bgShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+bgShadow.BackgroundTransparency = 1
+bgShadow.BorderSizePixel = 0
+bgShadow.ZIndex = 19
+bgShadow.Parent = mainContainer
+
+local frame = Instance.new("Frame")
+frame.Name = "MainPanel"
+frame.Size = UDim2.new(1, 0, 1, 0)
+frame.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+frame.BackgroundTransparency = 1
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.ClipsDescendants = true
+frame.ZIndex = 20
+frame.Parent = mainContainer
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(40, 40, 55)
+mainStroke.Thickness = 1.5
+mainStroke.Transparency = 1
+mainStroke.Parent = frame
+
+local cornerTL = Instance.new("Frame")
+cornerTL.Size = UDim2.new(0, 8, 0, 8)
+cornerTL.Position = UDim2.new(0, -2, 0, -2)
+cornerTL.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+cornerTL.BorderSizePixel = 0
+cornerTL.ZIndex = 25
+cornerTL.BackgroundTransparency = 1
+cornerTL.Parent = frame
+
+local cornerBR = Instance.new("Frame")
+cornerBR.Size = UDim2.new(0, 8, 0, 8)
+cornerBR.Position = UDim2.new(1, -6, 1, -6)
+cornerBR.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+cornerBR.BorderSizePixel = 0
+cornerBR.ZIndex = 25
+cornerBR.BackgroundTransparency = 1
+cornerBR.Parent = frame
+
+local headerBar = Instance.new("Frame")
+headerBar.Size = UDim2.new(1, 0, 0, 38)
+headerBar.BackgroundColor3 = Color3.fromRGB(15, 15, 22)
+headerBar.BackgroundTransparency = 1
+headerBar.BorderSizePixel = 0
+headerBar.ZIndex = 21
+headerBar.Parent = frame
+
+local headerLine = Instance.new("Frame")
+headerLine.Size = UDim2.new(1, 0, 0, 1)
+headerLine.Position = UDim2.new(0, 0, 1, -1)
+headerLine.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+headerLine.BorderSizePixel = 0
+headerLine.ZIndex = 22
+headerLine.BackgroundTransparency = 1
+headerLine.Parent = headerBar
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -28, 1, 0)
+title.Position = UDim2.new(0, 14, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "CCT"
+title.TextColor3 = Color3.fromRGB(240, 240, 255)
+title.TextSize = 13
+title.Font = Enum.Font.GothamBlack
+title.TextTransparency = 1
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.ZIndex = 23
+title.Parent = headerBar
+
+local statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.new(0, 6, 0, 6)
+statusDot.Position = UDim2.new(1, -18, 0.5, -3)
+statusDot.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+statusDot.BorderSizePixel = 0
+statusDot.ZIndex = 23
+statusDot.BackgroundTransparency = 1
+statusDot.Parent = headerBar
+
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 76, 1, -70)
+sidebar.Position = UDim2.new(0, 0, 0, 38)
+sidebar.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+sidebar.BackgroundTransparency = 1
+sidebar.BorderSizePixel = 0
+sidebar.ZIndex = 21
+sidebar.Parent = frame
+
+local sidebarLine = Instance.new("Frame")
+sidebarLine.Size = UDim2.new(0, 1, 1, 0)
+sidebarLine.Position = UDim2.new(1, -1, 0, 0)
+sidebarLine.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+sidebarLine.BorderSizePixel = 0
+sidebarLine.ZIndex = 22
+sidebarLine.BackgroundTransparency = 1
+sidebarLine.Parent = sidebar
+
+local contentArea = Instance.new("Frame")
+contentArea.Size = UDim2.new(1, -76, 1, -70)
+contentArea.Position = UDim2.new(0, 76, 0, 38)
+contentArea.BackgroundTransparency = 1
+contentArea.ClipsDescendants = true
+contentArea.ZIndex = 21
+contentArea.Parent = frame
+
+local drivePage = Instance.new("Frame")
+drivePage.Size = UDim2.new(1, 0, 1, 0)
+drivePage.BackgroundTransparency = 1
+drivePage.Visible = true
+drivePage.ZIndex = 22
+drivePage.Parent = contentArea
+
+local modsPage = Instance.new("Frame")
+modsPage.Size = UDim2.new(1, 0, 1, 0)
+modsPage.BackgroundTransparency = 1
+modsPage.Visible = false
+modsPage.ZIndex = 22
+modsPage.Parent = contentArea
+
+local racingPage = Instance.new("Frame")
+racingPage.Size = UDim2.new(1, 0, 1, 0)
+racingPage.BackgroundTransparency = 1
+racingPage.Visible = false
+racingPage.ZIndex = 22
+racingPage.Parent = contentArea
+
+local trollPage = Instance.new("Frame")
+trollPage.Size = UDim2.new(1, 0, 1, 0)
+trollPage.BackgroundTransparency = 1
+trollPage.Visible = false
+trollPage.ZIndex = 22
+trollPage.Parent = contentArea
+
+local footerBar = Instance.new("Frame")
+footerBar.Size = UDim2.new(1, 0, 0, 32)
+footerBar.Position = UDim2.new(0, 0, 1, -32)
+footerBar.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+footerBar.BackgroundTransparency = 1
+footerBar.BorderSizePixel = 0
+footerBar.ZIndex = 21
+footerBar.Parent = frame
+
+local footerLine = Instance.new("Frame")
+footerLine.Size = UDim2.new(1, 0, 0, 1)
+footerLine.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+footerLine.BorderSizePixel = 0
+footerLine.ZIndex = 22
+footerLine.BackgroundTransparency = 1
+footerLine.Parent = footerBar
+
+local footerText = Instance.new("TextLabel")
+footerText.Size = UDim2.new(1, -24, 1, 0)
+footerText.Position = UDim2.new(0, 14, 0, 0)
+footerText.BackgroundTransparency = 1
+footerText.Text = "@CCT"
+footerText.TextColor3 = Color3.fromRGB(80, 80, 100)
+footerText.TextTransparency = 1
+footerText.TextSize = 9
+footerText.Font = Enum.Font.Code
+footerText.TextXAlignment = Enum.TextXAlignment.Left
+footerText.ZIndex = 23
+footerText.Parent = footerBar
+
+local function makeSidebarBtn(text, y)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -10, 0, 40)
+	btn.Position = UDim2.new(0, 5, 0, y)
+	btn.BackgroundColor3 = Color3.fromRGB(16, 16, 24)
+	btn.BackgroundTransparency = 1
+	btn.BorderSizePixel = 0
+	btn.Text = ""
+	btn.AutoButtonColor = false
+	btn.ZIndex = 23
+	btn.Parent = sidebar
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(40, 40, 55)
+	stroke.Thickness = 1
+	stroke.Transparency = 1
+	stroke.Parent = btn
+
+	local ind = Instance.new("Frame")
+	ind.Size = UDim2.new(0, 3, 1, 0)
+	ind.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+	ind.BorderSizePixel = 0
+	ind.BackgroundTransparency = 1
+	ind.ZIndex = 24
+	ind.Parent = btn
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -12, 1, 0)
+	label.Position = UDim2.new(0, 10, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = text
+	label.TextColor3 = Color3.fromRGB(140, 140, 160)
+	label.TextTransparency = 1
+	label.TextSize = 12
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextWrapped = true
+	label.ZIndex = 24
+	label.Parent = btn
+
+	btn.MouseEnter:Connect(function()
+		hoverSound:Play()
+		if not btn:GetAttribute("Selected") then
+			TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(22, 22, 32)}):Play()
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if not btn:GetAttribute("Selected") then
+			TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(16, 16, 24)}):Play()
+		end
+	end)
+
+	return btn, label, stroke, ind
+end
+
+local driveSideBtn, driveSideLabel, driveSideStroke, driveSideInd = makeSidebarBtn("DRIVE", 4)
+local modsSideBtn, modsSideLabel, modsSideStroke, modsSideInd = makeSidebarBtn("CAR MODS", 48)
+local racingSideBtn, racingSideLabel, racingSideStroke, racingSideInd = makeSidebarBtn("RACING", 92)
+local trollSideBtn, trollSideLabel, trollSideStroke, trollSideInd = makeSidebarBtn("TROLL", 136)
+local musicSideBtn, musicSideLabel, musicSideStroke, musicSideInd = makeSidebarBtn("MUSIC ID", 180)
+local otherSideBtn, otherSideLabel, otherSideStroke, otherSideInd = makeSidebarBtn("OTHER", 224)
+local statsSideBtn, statsSideLabel, statsSideStroke, statsSideInd = makeSidebarBtn("STATS", 268)
+local devSideBtn, devSideLabel, devSideStroke, devSideInd = makeSidebarBtn("DEV", 312)
+
+local otherPage = Instance.new("Frame")
+otherPage.Size = UDim2.new(1, 0, 1, 0)
+otherPage.BackgroundTransparency = 1
+otherPage.Visible = false
+otherPage.ZIndex = 22
+otherPage.Parent = contentArea
+
+local statsPage = Instance.new("Frame")
+statsPage.Size = UDim2.new(1, 0, 1, 0)
+statsPage.BackgroundTransparency = 1
+statsPage.Visible = false
+statsPage.ZIndex = 22
+statsPage.Parent = contentArea
+
+local devPage = Instance.new("Frame")
+devPage.Size = UDim2.new(1, 0, 1, 0)
+devPage.BackgroundTransparency = 1
+devPage.Visible = false
+devPage.ZIndex = 22
+devPage.Parent = contentArea
+
+local musicPage = Instance.new("Frame")
+musicPage.Size = UDim2.new(1, 0, 1, 0)
+musicPage.BackgroundTransparency = 1
+musicPage.Visible = false
+musicPage.ZIndex = 22
+musicPage.Parent = contentArea
+
+local function selectPage(pageName)
+	drivePage.Visible = (pageName == "Drive")
+	modsPage.Visible = (pageName == "Mods")
+	racingPage.Visible = (pageName == "Racing")
+	trollPage.Visible = (pageName == "Troll")
+	musicPage.Visible = (pageName == "Music")
+	otherPage.Visible = (pageName == "Other")
+	statsPage.Visible = (pageName == "Stats")
+	devPage.Visible = (pageName == "Dev")
+
+	local function setSide(btn, label, stroke, ind, selected)
+		btn:SetAttribute("Selected", selected)
+		if selected then
+			label.TextColor3 = Color3.fromRGB(255, 255, 255)
+			TweenService:Create(stroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(0, 220, 255)}):Play()
+			TweenService:Create(ind, TweenInfo.new(0.2), {BackgroundTransparency = 0}):Play()
+			TweenService:Create(btn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(22, 22, 34)}):Play()
+		else
+			label.TextColor3 = Color3.fromRGB(140, 140, 160)
+			TweenService:Create(stroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(40, 40, 55)}):Play()
+			TweenService:Create(ind, TweenInfo.new(0.2), {BackgroundTransparency = 1}):Play()
+			TweenService:Create(btn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(16, 16, 24)}):Play()
+		end
+	end
+
+	setSide(driveSideBtn, driveSideLabel, driveSideStroke, driveSideInd, pageName == "Drive")
+	setSide(modsSideBtn, modsSideLabel, modsSideStroke, modsSideInd, pageName == "Mods")
+	setSide(racingSideBtn, racingSideLabel, racingSideStroke, racingSideInd, pageName == "Racing")
+	setSide(trollSideBtn, trollSideLabel, trollSideStroke, trollSideInd, pageName == "Troll")
+	setSide(musicSideBtn, musicSideLabel, musicSideStroke, musicSideInd, pageName == "Music")
+	setSide(otherSideBtn, otherSideLabel, otherSideStroke, otherSideInd, pageName == "Other")
+	setSide(statsSideBtn, statsSideLabel, statsSideStroke, statsSideInd, pageName == "Stats")
+	setSide(devSideBtn, devSideLabel, devSideStroke, devSideInd, pageName == "Dev")
+end
+
+driveSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Drive") end)
+modsSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Mods") end)
+racingSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Racing") end)
+trollSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Troll") end)
+musicSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Music") end)
+otherSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Other") end)
+statsSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Stats") end)
+devSideBtn.MouseButton1Click:Connect(function() clickSound:Play() selectPage("Dev") end)
+
+local function makeContentButton(parent, text, imageId, y)
+	local btnContainer = Instance.new("Frame")
+	btnContainer.Size = UDim2.new(1, -18, 0, 46)
+	btnContainer.Position = UDim2.new(0, 9, 0, y)
+	btnContainer.BackgroundTransparency = 1
+	btnContainer.ZIndex = 23
+	btnContainer.Parent = parent
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 1, 0)
+	btn.BackgroundColor3 = Color3.fromRGB(16, 16, 24)
+	btn.BackgroundTransparency = 1
+	btn.BorderSizePixel = 0
+	btn.Text = ""
+	btn.AutoButtonColor = false
+	btn.ZIndex = 24
+	btn.Parent = btnContainer
+
+	local btnStroke = Instance.new("UIStroke")
+	btnStroke.Color = Color3.fromRGB(40, 40, 55)
+	btnStroke.Thickness = 1
+	btnStroke.Transparency = 1
+	btnStroke.Parent = btn
+
+	local indicator = Instance.new("Frame")
+	indicator.Size = UDim2.new(0, 3, 1, 0)
+	indicator.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+	indicator.BorderSizePixel = 0
+	indicator.BackgroundTransparency = 1
+	indicator.ZIndex = 25
+	indicator.Parent = btn
+
+	local iconLabel = nil
+	if imageId and imageId ~= "" then
+		iconLabel = Instance.new("ImageLabel")
+		iconLabel.Size = UDim2.new(0, 16, 0, 16)
+		iconLabel.Position = UDim2.new(0, 12, 0.5, -8)
+		iconLabel.BackgroundTransparency = 1
+		iconLabel.Image = imageId
+		iconLabel.ImageColor3 = Color3.fromRGB(130, 130, 150)
+		iconLabel.ImageTransparency = 1
+		iconLabel.ScaleType = Enum.ScaleType.Fit
+		iconLabel.ZIndex = 25
+		iconLabel.Parent = btn
+	end
+
+	local textLabel = Instance.new("TextLabel")
+	textLabel.Size = UDim2.new(1, iconLabel and -42 or -22, 1, 0)
+	textLabel.Position = UDim2.new(0, iconLabel and 36 or 14, 0, 0)
+	textLabel.BackgroundTransparency = 1
+	textLabel.Text = text
+	textLabel.TextColor3 = Color3.fromRGB(170, 170, 190)
+	textLabel.TextTransparency = 1
+	textLabel.TextSize = 12
+	textLabel.Font = Enum.Font.GothamBold
+	textLabel.TextXAlignment = Enum.TextXAlignment.Left
+	textLabel.ZIndex = 25
+	textLabel.Parent = btn
+
+	local stateTag = Instance.new("TextLabel")
+	stateTag.Size = UDim2.new(0, 38, 1, 0)
+	stateTag.Position = UDim2.new(1, -46, 0, 0)
+	stateTag.BackgroundTransparency = 1
+	stateTag.Text = "OFF"
+	stateTag.TextColor3 = Color3.fromRGB(90, 90, 110)
+	stateTag.TextTransparency = 1
+	stateTag.TextSize = 11
+	stateTag.Font = Enum.Font.Code
+	stateTag.TextXAlignment = Enum.TextXAlignment.Right
+	stateTag.ZIndex = 25
+	stateTag.Parent = btn
+
+	btn.MouseEnter:Connect(function()
+		hoverSound:Play()
+		TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(22, 22, 32)}):Play()
+		if not btn:GetAttribute("Active") then
+			TweenService:Create(btnStroke, TweenInfo.new(0.15), {Color = Color3.fromRGB(70, 70, 95)}):Play()
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(16, 16, 24)}):Play()
+		if not btn:GetAttribute("Active") then
+			TweenService:Create(btnStroke, TweenInfo.new(0.15), {Color = Color3.fromRGB(40, 40, 55)}):Play()
+		end
+	end)
+	btn.MouseButton1Down:Connect(function()
+		clickSound:Play()
+		TweenService:Create(btn, TweenInfo.new(0.08), {Position = UDim2.new(0, 1, 0, 0)}):Play()
+	end)
+	btn.MouseButton1Up:Connect(function()
+		TweenService:Create(btn, TweenInfo.new(0.08), {Position = UDim2.new(0, 0, 0, 0)}):Play()
+	end)
+
+	return btn, textLabel, iconLabel, btnStroke, indicator, stateTag
+end
+
+local function updateBtn(btn, textLabel, iconLabel, btnStroke, indicator, stateTag, active)
+	btn:SetAttribute("Active", active)
+	if active then
+		stateTag.Text = "ON"
+		stateTag.TextColor3 = Color3.fromRGB(0, 220, 255)
+		textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		if iconLabel then iconLabel.ImageColor3 = Color3.fromRGB(0, 220, 255) end
+		TweenService:Create(btnStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(0, 220, 255)}):Play()
+		TweenService:Create(indicator, TweenInfo.new(0.2), {BackgroundTransparency = 0}):Play()
+	else
+		stateTag.Text = "OFF"
+		stateTag.TextColor3 = Color3.fromRGB(90, 90, 110)
+		textLabel.TextColor3 = Color3.fromRGB(170, 170, 190)
+		if iconLabel then iconLabel.ImageColor3 = Color3.fromRGB(130, 130, 150) end
+		TweenService:Create(btnStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(40, 40, 55)}):Play()
+		TweenService:Create(indicator, TweenInfo.new(0.2), {BackgroundTransparency = 1}):Play()
+	end
+end
+
+local afkBtn, afkText, afkIcon, afkStroke, afkInd, afkTag
+local collisionBtn, collisionText, collisionIcon, collisionStroke, collisionInd, collisionTag
+local driveBtn, driveText, driveIcon, driveStroke, driveInd, driveTag
+
+if AFK_DISABLED then
+	local warnFrame = Instance.new("Frame")
+	warnFrame.Size = UDim2.new(1, -18, 0, 46)
+	warnFrame.Position = UDim2.new(0, 9, 0, 12)
+	warnFrame.BackgroundColor3 = Color3.fromRGB(32, 22, 8)
+	warnFrame.BorderSizePixel = 0
+	warnFrame.ZIndex = 24
+	warnFrame.Parent = drivePage
+
+	local warnStroke = Instance.new("UIStroke")
+	warnStroke.Color = Color3.fromRGB(255, 155, 30)
+	warnStroke.Thickness = 1
+	warnStroke.Parent = warnFrame
+
+	local warnAccent = Instance.new("Frame")
+	warnAccent.Size = UDim2.new(0, 3, 1, 0)
+	warnAccent.BackgroundColor3 = Color3.fromRGB(255, 155, 30)
+	warnAccent.BorderSizePixel = 0
+	warnAccent.ZIndex = 25
+	warnAccent.Parent = warnFrame
+
+	local warnTitle = Instance.new("TextLabel")
+	warnTitle.Size = UDim2.new(1, -16, 0, 18)
+	warnTitle.Position = UDim2.new(0, 14, 0, 6)
+	warnTitle.BackgroundTransparency = 1
+	warnTitle.Text = "AFK ROUTE"
+	warnTitle.TextColor3 = Color3.fromRGB(255, 175, 50)
+	warnTitle.TextSize = 12
+	warnTitle.Font = Enum.Font.GothamBold
+	warnTitle.TextXAlignment = Enum.TextXAlignment.Left
+	warnTitle.ZIndex = 25
+	warnTitle.Parent = warnFrame
+
+	local warnSub = Instance.new("TextLabel")
+	warnSub.Size = UDim2.new(1, -16, 0, 16)
+	warnSub.Position = UDim2.new(0, 14, 0, 24)
+	warnSub.BackgroundTransparency = 1
+	warnSub.Text = "Not available for this map"
+	warnSub.TextColor3 = Color3.fromRGB(210, 150, 60)
+	warnSub.TextSize = 11
+	warnSub.Font = Enum.Font.Code
+	warnSub.TextXAlignment = Enum.TextXAlignment.Left
+	warnSub.ZIndex = 25
+	warnSub.Parent = warnFrame
+else
+	afkBtn, afkText, afkIcon, afkStroke, afkInd, afkTag = makeContentButton(drivePage, "AFK ROUTE", AFK_ICON_ID, 12)
+end
+
+collisionBtn, collisionText, collisionIcon, collisionStroke, collisionInd, collisionTag = makeContentButton(drivePage, "CAR COLLISION", COLLISION_ICON_ID, 68)
+driveBtn, driveText, driveIcon, driveStroke, driveInd, driveTag = makeContentButton(drivePage, "CAR COMBO", DRIVE_ICON_ID, 124)
+
+local accelBtn, accelText, accelIcon, accelStroke, accelInd, accelTag = makeContentButton(modsPage, "ACCELERATION", ACCEL_ICON_ID, 12)
+local brakeBtn, brakeText, brakeIcon, brakeStroke, brakeInd, brakeTag = makeContentButton(modsPage, "BRAKE FORCE", BRAKE_ICON_ID, 68)
+
+local function makeSlider(parent, labelText, y, min, max, default, callback)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, -18, 0, 50)
+	container.Position = UDim2.new(0, 9, 0, y)
+	container.BackgroundTransparency = 1
+	container.ZIndex = 23
+	container.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -50, 0, 16)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.TextColor3 = Color3.fromRGB(160, 160, 180)
+	label.TextSize = 11
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.ZIndex = 24
+	label.Parent = container
+
+	local valueLabel = Instance.new("TextLabel")
+	valueLabel.Size = UDim2.new(0, 42, 0, 16)
+	valueLabel.Position = UDim2.new(1, -42, 0, 0)
+	valueLabel.BackgroundTransparency = 1
+	valueLabel.Text = tostring(default)
+	valueLabel.TextColor3 = Color3.fromRGB(0, 220, 255)
+	valueLabel.TextSize = 11
+	valueLabel.Font = Enum.Font.Code
+	valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+	valueLabel.ZIndex = 24
+	valueLabel.Parent = container
+
+	local barBG = Instance.new("Frame")
+	barBG.Size = UDim2.new(1, 0, 0, 6)
+	barBG.Position = UDim2.new(0, 0, 0, 28)
+	barBG.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+	barBG.BorderSizePixel = 0
+	barBG.ZIndex = 24
+	barBG.Parent = container
+
+	local barFill = Instance.new("Frame")
+	barFill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+	barFill.BackgroundColor3 = Color3.fromRGB(0, 220, 255)
+	barFill.BorderSizePixel = 0
+	barFill.ZIndex = 25
+	barFill.Parent = barBG
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.new(0, 12, 0, 12)
+	knob.Position = UDim2.new((default - min) / (max - min), -6, 0.5, -6)
+	knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	knob.BorderSizePixel = 0
+	knob.ZIndex = 26
+	knob.Parent = barBG
+
+	local dragging = false
+	local function update(val)
+		val = math.clamp(val, min, max)
+		local pct = (val - min) / (max - min)
+		barFill.Size = UDim2.new(pct, 0, 1, 0)
+		knob.Position = UDim2.new(pct, -6, 0.5, -6)
+		valueLabel.Text = tostring(math.floor(val + 0.5))
+		callback(val)
+	end
+
+	barBG.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+		end
+	end)
+	UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local rel = (input.Position.X - barBG.AbsolutePosition.X) / barBG.AbsoluteSize.X
+			update(min + rel * (max - min))
+		end
+	end)
+end
+
+makeSlider(modsPage, "Accel Multiplier (‰)", 124, 0, 50, 25, function(v) velocityMult = v / 1000 end)
+makeSlider(modsPage, "Brake Force (‰)", 182, 0, 300, 150, function(v) brakeMult = v / 1000 end)
+
+local raceBtn, raceText, raceIcon, raceStroke, raceInd, raceTag
+
+if RACE_ENABLED then
+	raceBtn, raceText, raceIcon, raceStroke, raceInd, raceTag = makeContentButton(racingPage, "AUTO RACE", RACE_ICON_ID, 12)
+
+	raceInfoText = Instance.new("TextLabel")
+	raceInfoText.Size = UDim2.new(1, -18, 0, 40)
+	raceInfoText.Position = UDim2.new(0, 9, 0, 68)
+	raceInfoText.BackgroundTransparency = 1
+	raceInfoText.Text = "Avoid getting on leaderboard!"
+	raceInfoText.TextColor3 = Color3.fromRGB(120, 120, 140)
+	raceInfoText.TextSize = 11
+	raceInfoText.Font = Enum.Font.Code
+	raceInfoText.TextXAlignment = Enum.TextXAlignment.Left
+	raceInfoText.TextYAlignment = Enum.TextYAlignment.Top
+	raceInfoText.ZIndex = 24
+	raceInfoText.Parent = racingPage
+
+	makeSlider(racingPage, "Drive Speed (lower = slower)", 120, 40, 400, 180, function(v)
+		raceTeleportSpeed = v -- shared as race drive speed
+	end)
+else
+	local comingSoon = Instance.new("TextLabel")
+	comingSoon.Size = UDim2.new(1, -20, 1, -20)
+	comingSoon.Position = UDim2.new(0, 10, 0, 10)
+	comingSoon.BackgroundTransparency = 1
+	comingSoon.Text = "COMING SOON"
+	comingSoon.TextColor3 = Color3.fromRGB(100, 100, 120)
+	comingSoon.TextSize = 18
+	comingSoon.Font = Enum.Font.GothamBlack
+	comingSoon.ZIndex = 24
+	comingSoon.Parent = racingPage
+end
+
+-- ==================== TROLL PAGE ====================
+local trollAccessOverlay = nil
+
+local function createTrollAccessOverlay()
+	if trollAccessOverlay then trollAccessOverlay:Destroy() end
+	
+	trollAccessOverlay = Instance.new("Frame")
+	trollAccessOverlay.Size = UDim2.new(1, 0, 1, 0)
+	trollAccessOverlay.BackgroundColor3 = Color3.fromRGB(5, 5, 8)
+	trollAccessOverlay.BackgroundTransparency = 0.3
+	trollAccessOverlay.BorderSizePixel = 0
+	trollAccessOverlay.ZIndex = 100
+	trollAccessOverlay.Parent = trollPage
+	
+	local msgFrame = Instance.new("Frame")
+	msgFrame.Size = UDim2.new(0, 200, 0, 120)
+	msgFrame.Position = UDim2.new(0.5, -100, 0.5, -60)
+	msgFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 22)
+	msgFrame.BorderSizePixel = 0
+	msgFrame.ZIndex = 101
+	msgFrame.Parent = trollAccessOverlay
+	
+	local msgStroke = Instance.new("UIStroke")
+	msgStroke.Color = Color3.fromRGB(200, 80, 80)
+	msgStroke.Thickness = 1.5
+	msgStroke.Parent = msgFrame
+	
+	local msgTitle = Instance.new("TextLabel")
+	msgTitle.Size = UDim2.new(1, 0, 0, 35)
+	msgTitle.BackgroundTransparency = 1
+	msgTitle.Text = "You must have this purchased ! Join server to buy."
+	msgTitle.TextColor3 = Color3.fromRGB(255, 100, 100)
+	msgTitle.TextSize = 12
+	msgTitle.Font = Enum.Font.GothamBold
+	msgTitle.TextWrapped = true
+	msgTitle.ZIndex = 102
+	msgTitle.Parent = msgFrame
+	
+	local copyBtn = Instance.new("TextButton")
+	copyBtn.Size = UDim2.new(0, 160, 0, 30)
+	copyBtn.Position = UDim2.new(0.5, -80, 0, 45)
+	copyBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+	copyBtn.BorderSizePixel = 0
+	copyBtn.Text = ""
+	copyBtn.ZIndex = 102
+	copyBtn.Parent = msgFrame
+	
+	local copyStroke = Instance.new("UIStroke")
+	copyStroke.Color = Color3.fromRGB(0, 220, 255)
+	copyStroke.Thickness = 1
+	copyStroke.Parent = copyBtn
+	
+	local copyLabel = Instance.new("TextLabel")
+	copyLabel.Size = UDim2.new(1, 0, 1, 0)
+	copyLabel.BackgroundTransparency = 1
+	copyLabel.Text = "Click to copy Server link !"
+	copyLabel.TextColor3 = Color3.fromRGB(0, 220, 255)
+	copyLabel.TextSize = 11
+	copyLabel.Font = Enum.Font.GothamBold
+	copyLabel.ZIndex = 103
+	copyLabel.Parent = copyBtn
+	
+	copyBtn.MouseButton1Click:Connect(function()
+		clickSound:Play()
+		copyToClipboard("https://discord.gg/2D5rZe5AGz")
+	end)
+	
+	copyBtn.MouseEnter:Connect(function()
+		hoverSound:Play()
+		TweenService:Create(copyBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(25, 25, 40)}):Play()
+	end)
+	
+	copyBtn.MouseLeave:Connect(function()
+		TweenService:Create(copyBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(20, 20, 30)}):Play()
+	end)
+end
+
+if not hasTrollAccess() then
+	createTrollAccessOverlay()
+else
+	-- Create scrolling frame for troll content with proper sizing
+	local trollScroll = Instance.new("ScrollingFrame")
+	trollScroll.Size = UDim2.new(1, 0, 1, 0)
+	trollScroll.CanvasSize = UDim2.new(0, 0, 0, 780)
+	trollScroll.ScrollBarThickness = 6
+	trollScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 220, 255)
+	trollScroll.BackgroundTransparency = 1
+	trollScroll.BorderSizePixel = 0
+	trollScroll.ZIndex = 23
+	trollScroll.Parent = trollPage
+	
+	-- Level Increase Button
+	local levelBtn, levelText, levelIcon, levelStroke, levelInd, levelTag = makeContentButton(trollScroll, "LEVEL INCREASE", "", 12)
+	levelBtn.BackgroundTransparency = 0
+	levelText.TextTransparency = 0
+	levelStroke.Transparency = 0
+	levelInd.BackgroundTransparency = 1
+	
+	-- Money Increase Button
+	local moneyBtn, moneyText, moneyIcon, moneyStroke, moneyInd, moneyTag = makeContentButton(trollScroll, "MONEY INCREASE", "", 68)
+	moneyBtn.BackgroundTransparency = 0
+	moneyText.TextTransparency = 0
+	moneyStroke.Transparency = 0
+	moneyInd.BackgroundTransparency = 1
+	
+	-- ==================== CARS SECTION ====================
+	-- Car Giver Section Title
+	local carTitle = Instance.new("TextLabel")
+	carTitle.Size = UDim2.new(1, -18, 0, 20)
+	carTitle.Position = UDim2.new(0, 9, 0, 124)
+	carTitle.BackgroundTransparency = 1
+	carTitle.Text = "Limited Cars Giver"
+	carTitle.TextColor3 = Color3.fromRGB(120, 120, 140)
+	carTitle.TextTransparency = 0
+	carTitle.TextSize = 10
+	carTitle.Font = Enum.Font.GothamBold
+	carTitle.ZIndex = 24
+	carTitle.Parent = trollScroll
+	
+	-- Fake Cars Grid Container (taller + uses UIGridLayout so nothing is clipped)
+	local carsContainer = Instance.new("Frame")
+	carsContainer.Size = UDim2.new(1, -18, 0, 560)
+	carsContainer.Position = UDim2.new(0, 9, 0, 148)
+	carsContainer.BackgroundTransparency = 1
+	carsContainer.ClipsDescendants = false
+	carsContainer.ZIndex = 23
+	carsContainer.Parent = trollScroll
+	
+	local carGrid = Instance.new("UIGridLayout")
+	carGrid.CellSize = UDim2.new(0, 105, 0, 128)
+	carGrid.CellPadding = UDim2.new(0, 10, 0, 12)
+	carGrid.FillDirection = Enum.FillDirection.Horizontal
+	carGrid.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	carGrid.SortOrder = Enum.SortOrder.LayoutOrder
+	carGrid.Parent = carsContainer
+	
+	local function makeFakeCarBtn(carData, index)
+		-- Container for each car (image + label)
+		local carContainer = Instance.new("Frame")
+		carContainer.Size = UDim2.new(0, 105, 0, 128)
+		carContainer.BackgroundTransparency = 1
+		carContainer.LayoutOrder = index
+		carContainer.ZIndex = 24
+		carContainer.Parent = carsContainer
+		
+		-- Image Button
+		local carBtn = Instance.new("ImageButton")
+		carBtn.Size = UDim2.new(1, 0, 0, 90)
+		carBtn.Position = UDim2.new(0, 0, 0, 0)
+		carBtn.Image = carData.image
+		carBtn.ScaleType = Enum.ScaleType.Fit
+		carBtn.ImageTransparency = 0
+		carBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+		carBtn.BackgroundTransparency = 0
+		carBtn.BorderSizePixel = 0
+		carBtn.ZIndex = 25
+		carBtn.Parent = carContainer
+		
+		local carCorner = Instance.new("UICorner")
+		carCorner.CornerRadius = UDim.new(0, 6)
+		carCorner.Parent = carBtn
+		
+		local carStroke = Instance.new("UIStroke")
+		carStroke.Color = Color3.fromRGB(40, 40, 55)
+		carStroke.Thickness = 1.5
+		carStroke.Transparency = 0
+		carStroke.Parent = carBtn
+		
+		-- Car Name Label - Below the image
+		local carLabel = Instance.new("TextLabel")
+		carLabel.Size = UDim2.new(1, 0, 0, 34)
+		carLabel.Position = UDim2.new(0, 0, 0, 92)
+		carLabel.BackgroundTransparency = 1
+		carLabel.Text = carData.name
+		carLabel.TextColor3 = Color3.fromRGB(170, 170, 190)
+		carLabel.TextTransparency = 0
+		carLabel.TextSize = 9
+		carLabel.Font = Enum.Font.GothamBold
+		carLabel.TextScaled = true
+		carLabel.TextWrapped = true
+		carLabel.TextXAlignment = Enum.TextXAlignment.Center
+		carLabel.TextYAlignment = Enum.TextYAlignment.Top
+		carLabel.ZIndex = 26
+		carLabel.Parent = carContainer
+		
+		carBtn.MouseButton1Click:Connect(function()
+			clickSound:Play()
+			local msgs = {
+				carData.name .. " has been added to Garage, Please dont duplicate the car to avoid notice !",
+				carData.name .. " failed to be added into Garage, Please try again later ! ( If this keeps happening please contact us )"
+			}
+			local selectedMsg = msgs[math.random(1, #msgs)]
+			print(selectedMsg)
+			
+			local notifFrame = Instance.new("Frame")
+			notifFrame.Size = UDim2.new(0, 280, 0, 60)
+			notifFrame.Position = UDim2.new(0.5, -140, 0, 20)
+			notifFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 22)
+			notifFrame.BorderSizePixel = 0
+			notifFrame.ZIndex = 200
+			notifFrame.Parent = gui
+			
+			local notifStroke = Instance.new("UIStroke")
+			notifStroke.Color = Color3.fromRGB(0, 220, 255)
+			notifStroke.Thickness = 1
+			notifStroke.Parent = notifFrame
+			
+			local notifText = Instance.new("TextLabel")
+			notifText.Size = UDim2.new(1, -10, 1, 0)
+			notifText.Position = UDim2.new(0, 5, 0, 0)
+			notifText.BackgroundTransparency = 1
+			notifText.Text = selectedMsg
+			notifText.TextColor3 = Color3.fromRGB(0, 220, 255)
+			notifText.TextSize = 9
+			notifText.Font = Enum.Font.Code
+			notifText.TextWrapped = true
+			notifText.TextXAlignment = Enum.TextXAlignment.Center
+			notifText.TextYAlignment = Enum.TextYAlignment.Center
+			notifText.ZIndex = 201
+			notifText.Parent = notifFrame
+			
+			TweenService:Create(notifFrame, TweenInfo.new(3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = UDim2.new(0.5, -140, 1, -80)}):Play()
+			task.wait(3.2)
+			notifFrame:Destroy()
+			
+			-- ACTUALLY KICK THE PLAYER
+			task.wait(0.5)
+			player:Kick("Unkown Error occurred")
+		end)
+		
+		carBtn.MouseEnter:Connect(function()
+			hoverSound:Play()
+			TweenService:Create(carBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(25, 25, 40)}):Play()
+			TweenService:Create(carStroke, TweenInfo.new(0.15), {Color = Color3.fromRGB(0, 220, 255)}):Play()
+			TweenService:Create(carLabel, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(255, 255, 255)}):Play()
+		end)
+		
+		carBtn.MouseLeave:Connect(function()
+			TweenService:Create(carBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(20, 20, 30)}):Play()
+			TweenService:Create(carStroke, TweenInfo.new(0.15), {Color = Color3.fromRGB(40, 40, 55)}):Play()
+			TweenService:Create(carLabel, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(170, 170, 190)}):Play()
+		end)
+	end
+	
+	for i, carData in ipairs(FAKE_CARS) do
+		makeFakeCarBtn(carData, i)
+	end
+	
+	-- Level Increase Logic
+	levelBtn.MouseButton1Click:Connect(function()
+		trollLevelActive = not trollLevelActive
+		updateBtn(levelBtn, levelText, nil, levelStroke, levelInd, levelTag, trollLevelActive)
+		
+		if trollLevelActive then
+			task.spawn(function()
+				while trollLevelActive do
+					local char = player.Character
+					if char then
+						local playerGui2 = player:WaitForChild("PlayerGui")
+						local inGameHUD = playerGui2:FindFirstChild("InGameHUD")
+						if inGameHUD then
+							local levelDisplay = inGameHUD:FindFirstChild("LevelDisplay")
+							if levelDisplay then
+								local rankTitle = levelDisplay:FindFirstChild("RankTitle")
+								if rankTitle then
+									local text = rankTitle.Text
+									if string.match(text, "Rank%s+•%s+Lvl%s+(%d+)") then
+										rankTitle.Text = string.gsub(text, "Lvl%s+(%d+)", function(num)
+											return "Lvl " .. (tonumber(num) + 1)
+										end)
+									end
+								end
+							end
+						end
+					end
+					
+					local leaderstats = player:FindFirstChild("leaderstats")
+					if leaderstats then
+						local levelVal = leaderstats:FindFirstChild("Level")
+						if levelVal and levelVal:IsA("IntValue") then
+							levelVal.Value = levelVal.Value + 1
+						end
+					end
+					
+					task.wait(1)
+				end
+			end)
+		end
+	end)
+	
+	-- Money Increase Logic
+	moneyBtn.MouseButton1Click:Connect(function()
+		trollMoneyActive = not trollMoneyActive
+		updateBtn(moneyBtn, moneyText, nil, moneyStroke, moneyInd, moneyTag, trollMoneyActive)
+		
+		if trollMoneyActive then
+			task.spawn(function()
+				while trollMoneyActive do
+					local char = player.Character
+					if char then
+						local playerGui2 = player:WaitForChild("PlayerGui")
+						local inGameHUD = playerGui2:FindFirstChild("InGameHUD")
+						if inGameHUD then
+							local newHUD = inGameHUD:FindFirstChild("NewHUD")
+							if newHUD then
+								local moneyHUD2 = newHUD:FindFirstChild("MoneyHUD2")
+								if moneyHUD2 then
+									local moneyHUD = moneyHUD2:FindFirstChild("MoneyHUD")
+									if moneyHUD and moneyHUD:IsA("TextLabel") then
+										local currentText = moneyHUD.Text
+										local currentVal = tonumber(string.match(currentText, "%d+")) or 0
+										moneyHUD.Text = tostring(currentVal + 1000)
+									end
+								end
+							end
+						end
+					end
+					
+					local leaderstats = player:FindFirstChild("leaderstats")
+					if leaderstats then
+						local cashVal = leaderstats:FindFirstChild("Cash")
+						if cashVal and cashVal:IsA("IntValue") then
+							cashVal.Value = cashVal.Value + 1000
+						end
+					end
+					
+					task.wait(1.2)
+				end
+			end)
+		end
+	end)
+end
+
+-- ==================== STATS PAGE ====================
+-- ==================== STATS PAGE ====================
+local function setupStatsPage()
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(1, 0, 1, 0)
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 360)
+	scroll.ScrollBarThickness = 5
+	scroll.ScrollBarImageColor3 = Color3.fromRGB(0, 220, 255)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ZIndex = 23
+	scroll.Parent = statsPage
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Size = UDim2.new(0, 64, 0, 64)
+	avatar.Position = UDim2.new(0, 14, 0, 12)
+	avatar.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+	avatar.BorderSizePixel = 0
+	avatar.ZIndex = 24
+	avatar.Parent = scroll
+	local avCorner = Instance.new("UICorner")
+	avCorner.CornerRadius = UDim.new(1, 0)
+	avCorner.Parent = avatar
+	pcall(function()
+		avatar.Image = Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+	end)
+
+	local nameLab = Instance.new("TextLabel")
+	nameLab.Size = UDim2.new(1, -96, 0, 28)
+	nameLab.Position = UDim2.new(0, 88, 0, 16)
+	nameLab.BackgroundTransparency = 1
+	nameLab.Text = player.Name
+	nameLab.TextColor3 = Color3.fromRGB(255, 255, 255)
+	nameLab.TextSize = 16
+	nameLab.Font = Enum.Font.GothamBlack
+	nameLab.TextXAlignment = Enum.TextXAlignment.Left
+	nameLab.ZIndex = 24
+	nameLab.Parent = scroll
+
+	local uidLab = Instance.new("TextLabel")
+	uidLab.Size = UDim2.new(1, -96, 0, 18)
+	uidLab.Position = UDim2.new(0, 88, 0, 44)
+	uidLab.BackgroundTransparency = 1
+	uidLab.Text = "ID " .. tostring(player.UserId)
+	uidLab.TextColor3 = Color3.fromRGB(120, 120, 140)
+	uidLab.TextSize = 11
+	uidLab.Font = Enum.Font.Code
+	uidLab.TextXAlignment = Enum.TextXAlignment.Left
+	uidLab.ZIndex = 24
+	uidLab.Parent = scroll
+
+	local function statLine(y, title)
+		local t = Instance.new("TextLabel")
+		t.Size = UDim2.new(1, -28, 0, 18)
+		t.Position = UDim2.new(0, 14, 0, y)
+		t.BackgroundTransparency = 1
+		t.Text = title
+		t.TextColor3 = Color3.fromRGB(130, 130, 150)
+		t.TextSize = 11
+		t.Font = Enum.Font.GothamBold
+		t.TextXAlignment = Enum.TextXAlignment.Left
+		t.ZIndex = 24
+		t.Parent = scroll
+		local v = Instance.new("TextLabel")
+		v.Size = UDim2.new(1, -28, 0, 22)
+		v.Position = UDim2.new(0, 14, 0, y + 16)
+		v.BackgroundTransparency = 1
+		v.Text = "--"
+		v.TextColor3 = Color3.fromRGB(0, 220, 255)
+		v.TextSize = 14
+		v.Font = Enum.Font.Code
+		v.TextXAlignment = Enum.TextXAlignment.Left
+		v.RichText = true
+		v.ZIndex = 24
+		v.Parent = scroll
+		return v
+	end
+
+	local timeVal = statLine(90, "SCRIPT UPTIME")
+	local moneyVal = statLine(140, "TOTAL MONEY GAINED")
+	local premVal = statLine(190, "IS PREMIUM")
+	local execVal = statLine(240, "SCRIPT EXECUTIONS")
+	local afkVal = statLine(290, "LONGEST AFK ROUTE")
+
+	task.spawn(function()
+		while timeVal and timeVal.Parent do
+			timeVal.Text = formatHMS(os.clock() - sessionStart)
+			moneyVal.Text = "$" .. formatDots(StatsData.totalMoneyGained or 0)
+			if hasTrollAccess() then
+				premVal.Text = 'Is Premium: <font color="#00DC64">Yes</font>'
+			else
+				premVal.Text = 'Is Premium: <font color="#FF6464">No</font>'
+			end
+			execVal.Text = tostring(StatsData.execCount or 1)
+			afkVal.Text = formatHMS(math.max(StatsData.longestAfkSeconds or 0, currentAfkSeconds or 0))
+			task.wait(0.5)
+		end
+	end)
+end
+setupStatsPage()
+
+-- ==================== DEV PAGE ====================
+-- ==================== DEV PAGE ====================
+local function setupDevPage()
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(1, 0, 1, 0)
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 720)
+	scroll.ScrollBarThickness = 5
+	scroll.ScrollBarImageColor3 = Color3.fromRGB(0, 220, 255)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ZIndex = 23
+	scroll.Parent = devPage
+
+	local disc = Instance.new("TextLabel")
+	disc.Size = UDim2.new(1, -24, 0, 22)
+	disc.Position = UDim2.new(0, 12, 0, 12)
+	disc.BackgroundTransparency = 1
+	disc.Text = "DISCORD"
+	disc.TextColor3 = Color3.fromRGB(120, 120, 140)
+	disc.TextSize = 10
+	disc.Font = Enum.Font.GothamBold
+	disc.TextXAlignment = Enum.TextXAlignment.Left
+	disc.ZIndex = 24
+	disc.Parent = scroll
+
+	local discVal = Instance.new("TextLabel")
+	discVal.Size = UDim2.new(1, -24, 0, 28)
+	discVal.Position = UDim2.new(0, 12, 0, 32)
+	discVal.BackgroundTransparency = 1
+	discVal.Text = "@jazz.go  ( JazzJazz )"
+	discVal.TextColor3 = Color3.fromRGB(0, 220, 255)
+	discVal.TextSize = 15
+	discVal.Font = Enum.Font.GothamBlack
+	discVal.TextXAlignment = Enum.TextXAlignment.Left
+	discVal.ZIndex = 24
+	discVal.Parent = scroll
+
+	local msgTitle = Instance.new("TextLabel")
+	msgTitle.Size = UDim2.new(1, -24, 0, 22)
+	msgTitle.Position = UDim2.new(0, 12, 0, 70)
+	msgTitle.BackgroundTransparency = 1
+	msgTitle.Text = "DEV MESSAGE"
+	msgTitle.TextColor3 = Color3.fromRGB(120, 120, 140)
+	msgTitle.TextSize = 10
+	msgTitle.Font = Enum.Font.GothamBold
+	msgTitle.TextXAlignment = Enum.TextXAlignment.Left
+	msgTitle.ZIndex = 24
+	msgTitle.Parent = scroll
+
+	local msg = Instance.new("TextLabel")
+	msg.Size = UDim2.new(1, -24, 0, 600)
+	msg.Position = UDim2.new(0, 12, 0, 94)
+	msg.BackgroundTransparency = 1
+	msg.Text = "This script was made only Solo and spent all my time on this coding getting details etc... This was meant for the people that are lazy or have no time to grind on a pixel game, its all for fun and enjoyment to the coolest cars in the game, so everyone can start to catch up a little with the new drops. I've seen where people charge 10$ just for a key system, meanwhile this is free and keyless, execute any time, anywhere it works free! Just that i made 1 major part of the script cost ROBUX not money is that as a solo dev a little support helps me too, it engages me to create even cooler stuff and bring to life stuff you've never imagined before, This is my message to all the Developers too: The game that you have brought together is such an beautiful and crazy game but i feel like grinding hours and hours on a game is not good for most of the people, so here i made this that the player can freely leave their device on your game so you still earn money but to stop suffering hardly trying to sway through cars, to mantain and develop only their brain by focusing to only sway through obstacles in their life. This is something i did just for fun and try to start making people reach the cars that you brought to reach. - JazzJazz."
+	msg.TextColor3 = Color3.fromRGB(200, 200, 220)
+	msg.TextSize = 14
+	msg.Font = Enum.Font.Gotham
+	msg.TextWrapped = true
+	msg.TextYAlignment = Enum.TextYAlignment.Top
+	msg.TextXAlignment = Enum.TextXAlignment.Left
+	msg.ZIndex = 24
+	msg.Parent = scroll
+end
+setupDevPage()
+
+
+-- ==================== MUSIC ID PAGE ====================
+do
+	_G.__CCT = _G.__CCT or {}
+	_G.__CCT.musicPage = musicPage
+	_G.__CCT.hoverSound = hoverSound
+	_G.__CCT.clickSound = clickSound
+	_G.__CCT.copyToClipboard = copyToClipboard
+	_G.__CCT.TweenService = TweenService
+
+	local knownSongs = {
+		{name = "Ransom Music", id = "131465489873214"},
+		{name = "Papparazzi", id = "76735947142959"},
+		{name = "La Cheyenne", id = "80029255793033"},
+		{name = "Murder on my mind", id = "94211283608538"},
+		{name = "Miguel Phonk", id = "133340032771064"},
+		{name = "Bass & Loud", id = "92651262676052"},
+		{name = "Mexican shit", id = "107553113067574"},
+		{name = "Love Sosa", id = "90700803060941"},
+	}
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(1, 0, 1, 0)
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 24 + #knownSongs * 48 + 30)
+	scroll.ScrollBarThickness = 5
+	scroll.ScrollBarImageColor3 = Color3.fromRGB(0, 220, 255)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ZIndex = 23
+	scroll.Parent = musicPage
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -18, 0, 20)
+	title.Position = UDim2.new(0, 9, 0, 8)
+	title.BackgroundTransparency = 1
+	title.Text = "Known Songs"
+	title.TextColor3 = Color3.fromRGB(120, 120, 140)
+	title.TextSize = 11
+	title.Font = Enum.Font.GothamBold
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.ZIndex = 24
+	title.Parent = scroll
+
+	for i = 1, #knownSongs do
+		local info = knownSongs[i]
+		local y = 32 + (i - 1) * 48
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, -18, 0, 42)
+		btn.Position = UDim2.new(0, 9, 0, y)
+		btn.BackgroundColor3 = Color3.fromRGB(16, 16, 24)
+		btn.BorderSizePixel = 0
+		btn.Text = ""
+		btn.AutoButtonColor = false
+		btn.ZIndex = 24
+		btn.Parent = scroll
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.fromRGB(40, 40, 55)
+		stroke.Thickness = 1
+		stroke.Parent = btn
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, -55, 1, 0)
+		label.Position = UDim2.new(0, 12, 0, 0)
+		label.BackgroundTransparency = 1
+		label.Text = info.name
+		label.TextColor3 = Color3.fromRGB(170, 170, 190)
+		label.TextSize = 11
+		label.Font = Enum.Font.GothamBold
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.ZIndex = 25
+		label.Parent = btn
+		local tag = Instance.new("TextLabel")
+		tag.Size = UDim2.new(0, 45, 1, 0)
+		tag.Position = UDim2.new(1, -50, 0, 0)
+		tag.BackgroundTransparency = 1
+		tag.Text = "COPY"
+		tag.TextColor3 = Color3.fromRGB(90, 90, 110)
+		tag.TextSize = 9
+		tag.Font = Enum.Font.Code
+		tag.TextXAlignment = Enum.TextXAlignment.Right
+		tag.ZIndex = 25
+		tag.Parent = btn
+		btn.MouseEnter:Connect(function()
+			_G.__CCT.hoverSound:Play()
+			_G.__CCT.TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(22, 22, 32)}):Play()
+			_G.__CCT.TweenService:Create(label, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(255, 255, 255)}):Play()
+			_G.__CCT.TweenService:Create(tag, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(0, 220, 255)}):Play()
+		end)
+		btn.MouseLeave:Connect(function()
+			_G.__CCT.TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(16, 16, 24)}):Play()
+			_G.__CCT.TweenService:Create(label, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(170, 170, 190)}):Play()
+			_G.__CCT.TweenService:Create(tag, TweenInfo.new(0.15), {TextColor3 = Color3.fromRGB(90, 90, 110)}):Play()
+		end)
+		btn.MouseButton1Click:Connect(function()
+			_G.__CCT.clickSound:Play()
+			local ok = _G.__CCT.copyToClipboard(info.id)
+			tag.Text = ok and "OK" or "ERR"
+			tag.TextColor3 = ok and Color3.fromRGB(0, 220, 100) or Color3.fromRGB(255, 100, 100)
+			task.delay(0.9, function()
+				tag.Text = "COPY"
+				tag.TextColor3 = Color3.fromRGB(90, 90, 110)
+			end)
+		end)
+	end
+end
+
+-- ==================== EXPORT SHARED STATE FOR PART 2 ====================
+_G.__CCT = _G.__CCT or {}
+do
+	local S = _G.__CCT
+	S.player = player
+	S.Players = Players
+	S.Workspace = Workspace
+	S.RunService = RunService
+	S.TweenService = TweenService
+	S.UIS = UIS
+	S.playerGui = playerGui
+	S.gui = gui
+	S.mainContainer = mainContainer
+	S.clickSound = clickSound
+	S.hoverSound = hoverSound
+	S.updateBtn = updateBtn
+	S.makeContentButton = makeContentButton
+	S.selectPage = selectPage
+	S.copyToClipboard = copyToClipboard
+	S.hasTrollAccess = hasTrollAccess
+	S.comboContainer = comboContainer
+	S.TrafficFolder = TrafficFolder
+	S.AFK_POINTS = AFK_POINTS
+	S.AFK_SPEED = AFK_SPEED
+	S.AFK_ARRIVE_DIST = AFK_ARRIVE_DIST
+	S.AFK_DISABLED = AFK_DISABLED
+	S.RACE_ENABLED = RACE_ENABLED
+	S.FINISH_TELEPORT = FINISH_TELEPORT
+	S.LIFT = LIFT
+	S.DRIVE_FRONT_DIST = DRIVE_FRONT_DIST
+	S.DRIVE_BACK_DIST = DRIVE_BACK_DIST
+	S.DRIVE_SPEED = DRIVE_SPEED
+	S.DRIVE_SIDE_OFFSET = DRIVE_SIDE_OFFSET
+	S.ALARM_SOUND_ID = ALARM_SOUND_ID
+	-- flags (shared by reference via table)
+	S.state = {
+		afkActive = false,
+		collisionActive = false,
+		driveActive = false,
+		raceActive = false,
+		accelEnabled = false,
+		brakeEnabled = false,
+		velocityMult = velocityMult,
+		brakeMult = brakeMult,
+		raceTeleportSpeed = raceTeleportSpeed,
+	}
+	-- sync legacy locals used in part1 other code if needed
+	S.afkBtn = afkBtn
+	S.afkText = afkText
+	S.afkIcon = afkIcon
+	S.afkStroke = afkStroke
+	S.afkInd = afkInd
+	S.afkTag = afkTag
+	S.collisionBtn = collisionBtn
+	S.collisionText = collisionText
+	S.collisionIcon = collisionIcon
+	S.collisionStroke = collisionStroke
+	S.collisionInd = collisionInd
+	S.collisionTag = collisionTag
+	S.driveBtn = driveBtn
+	S.driveText = driveText
+	S.driveIcon = driveIcon
+	S.driveStroke = driveStroke
+	S.driveInd = driveInd
+	S.driveTag = driveTag
+	S.accelBtn = accelBtn
+	S.accelText = accelText
+	S.accelIcon = accelIcon
+	S.accelStroke = accelStroke
+	S.accelInd = accelInd
+	S.accelTag = accelTag
+	S.brakeBtn = brakeBtn
+	S.brakeText = brakeText
+	S.brakeIcon = brakeIcon
+	S.brakeStroke = brakeStroke
+	S.brakeInd = brakeInd
+	S.brakeTag = brakeTag
+	S.raceBtn = raceBtn
+	S.raceText = raceText
+	S.raceIcon = raceIcon
+	S.raceStroke = raceStroke
+	S.raceInd = raceInd
+	S.raceTag = raceTag
+	S.otherPage = otherPage
+	S.headerBar = headerBar
+	S.getCar = nil -- filled in Part2
+end
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/SuloHub/Obfuscations/refs/heads/main/Part2"))()
